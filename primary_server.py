@@ -37,7 +37,9 @@ def start_primary_server():
             print(f"[RECEIVED] Command from client: {data}")
 
             # Process supported commands
-            if data == "STATUS":
+            if data == "PING":
+                response = "PONG"
+            elif data == "STATUS":
                 response = "Primary Server is ONLINE"
             elif data == "TIME":
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -50,7 +52,7 @@ def start_primary_server():
                 print(f"[EXIT] Client {client_address} sent EXIT. Closing connection.")
                 break
             else:
-                response = f"Unknown command: '{data}'. Supported commands: STATUS, TIME, MESSAGE <text>, EXIT"
+                response = f"Unknown command: '{data}'. Supported commands: STATUS, TIME, MESSAGE <text>, PING, EXIT"
 
             # 6. Sendall: Send the response bytes back to the client
             client_socket.sendall(response.encode("utf-8"))
