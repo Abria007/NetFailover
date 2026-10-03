@@ -15,6 +15,23 @@ HEARTBEAT_INTERVAL = 2       # Send PING every 2 seconds
 SOCKET_TIMEOUT = 3.0         # Timeout in seconds for socket operations
 MAX_MISSED_HEARTBEATS = 3    # Consecutive missed heartbeats before declaring failure
 
+def display_connection_status(conn):
+    """
+    Displays a formatted status banner showing active server connection info.
+    """
+    server_name = conn.get("server", "PRIMARY")
+    ip = conn.get("ip", SERVER_IP)
+    port = conn.get("port", SERVER_PORT)
+    status = "ONLINE" if conn.get("alive", True) else "OFFLINE"
+
+    print("\n================================================")
+    print("           NETFAILOVER CLIENT")
+    print("================================================")
+    print(f"Active Server : {server_name}")
+    print(f"Server        : {ip}:{port}")
+    print(f"Status        : {status}")
+    print("================================================\n")
+
 def heartbeat_worker(conn, socket_lock, stop_event):
     """
     Background worker that sends periodic PING heartbeats to the active server,
@@ -93,6 +110,8 @@ def heartbeat_worker(conn, socket_lock, stop_event):
                         # 3. Update connection state and active server
                         conn["socket"] = backup_socket
                         conn["server"] = "BACKUP"
+                        conn["ip"] = BACKUP_SERVER_IP
+                        conn["port"] = BACKUP_SERVER_PORT
 
                         # 4. Reset heartbeat metrics for the Backup Server
                         missed_heartbeats = 0
@@ -100,6 +119,7 @@ def heartbeat_worker(conn, socket_lock, stop_event):
 
                         print(f"[FAILOVER] Connected to Backup Server at {BACKUP_SERVER_IP}:{BACKUP_SERVER_PORT}")
                         print("[FAILOVER] Client successfully switched to Backup Server.")
+                        display_connection_status(conn)
 
                     except Exception as e:
                         print(f"[FAILOVER] Could not connect to Backup Server at {BACKUP_SERVER_IP}:{BACKUP_SERVER_PORT} ({e}).")
@@ -124,6 +144,8 @@ def start_client():
     conn = {
         "socket": client_socket,
         "server": "PRIMARY",
+        "ip": SERVER_IP,
+        "port": SERVER_PORT,
         "alive": True
     }
 
@@ -131,6 +153,7 @@ def start_client():
         # 2. Connect initially to the Primary Server
         client_socket.connect((SERVER_IP, SERVER_PORT))
         print(f"[CONNECTED] Successfully connected to server at {SERVER_IP}:{SERVER_PORT}")
+        display_connection_status(conn)
         print("Available commands: STATUS | TIME | MESSAGE <text> | EXIT")
 
         # 3. Start background heartbeat thread
