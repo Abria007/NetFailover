@@ -6,15 +6,20 @@ import time
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 5000
 
-# Heartbeat configuration
-HEARTBEAT_INTERVAL = 2    # Send PING every 2 seconds
-SOCKET_TIMEOUT = 3.0      # Timeout in seconds for socket operations
+# Heartbeat & Fault Detection configuration
+HEARTBEAT_INTERVAL = 2       # Send PING every 2 seconds
+SOCKET_TIMEOUT = 3.0         # Timeout in seconds for socket operations
+MAX_MISSED_HEARTBEATS = 3    # Number of consecutive missed heartbeats to declare failure
 
 def heartbeat_worker(client_socket, socket_lock, stop_event):
     """
-    Background worker that sends periodic PING heartbeats to the server
-    and measures the round-trip response time.
+    Background worker that sends periodic PING heartbeats to the server,
+    measures round-trip response time, and detects server failure after
+    3 consecutive missed heartbeats.
     """
+    missed_heartbeats = 0
+    first_failure_time = None
+
     while not stop_event.is_set():
         # Wait for the next heartbeat interval or until stopped
         if stop_event.wait(HEARTBEAT_INTERVAL):
@@ -22,26 +27,45 @@ def heartbeat_worker(client_socket, socket_lock, stop_event):
 
         # Acquire lock to ensure heartbeat and user commands do not interleave on the socket
         with socket_lock:
+            probe_start = time.time()
             try:
                 print("\n[HEARTBEAT] PING")
-                start_time = time.time()
                 client_socket.sendall("PING".encode("utf-8"))
 
                 # Wait for server response (up to SOCKET_TIMEOUT)
                 response = client_socket.recv(1024).decode("utf-8").strip()
-                elapsed_ms = (time.time() - start_time) * 1000
+                elapsed_ms = (time.time() - probe_start) * 1000
 
                 if response == "PONG":
                     print(f"[HEARTBEAT] PONG (Response time: {elapsed_ms:.2f} ms)")
+                    # Reset failure counter and timer upon a successful heartbeat
+                    missed_heartbeats = 0
+                    first_failure_time = None
                 else:
                     print(f"[HEARTBEAT] Unexpected response: {response}")
+                    missed_heartbeats += 1
+                    if first_failure_time is None:
+                        first_failure_time = probe_start
 
             except socket.timeout:
-                print("[HEARTBEAT] Timeout: No PONG response received from server within 3 seconds.")
+                missed_heartbeats += 1
+                if first_failure_time is None:
+                    first_failure_time = probe_start
+                print(f"[HEARTBEAT] Timeout: No response received ({missed_heartbeats}/{MAX_MISSED_HEARTBEATS} missed).")
+
             except Exception as e:
                 if not stop_event.is_set():
-                    print(f"[HEARTBEAT] Connection error: {e}")
-                break
+                    missed_heartbeats += 1
+                    if first_failure_time is None:
+                        first_failure_time = probe_start
+                    print(f"[HEARTBEAT] Connection error ({missed_heartbeats}/{MAX_MISSED_HEARTBEATS} missed): {e}")
+
+        # Declare failure only after 3 consecutive missed heartbeats
+        if missed_heartbeats >= MAX_MISSED_HEARTBEATS:
+            detection_time = time.time() - first_failure_time
+            print("\n[FAILURE DETECTED] Primary server is not responding.")
+            print(f"[FAILURE DETECTED] Approximate failure detection time: {detection_time:.2f} seconds.")
+            break
 
 def start_client():
     # 1. Create a TCP/IP socket (AF_INET = IPv4, SOCK_STREAM = TCP)
