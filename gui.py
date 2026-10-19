@@ -1,459 +1,689 @@
 """
-NetFailover - GUI Dashboard
-Computer Networks Fault Detection & Automatic Failover Simulation
+NetFailover - Advanced NOC GUI Dashboard
+Computer Networks Fault Detection & Automatic Failover System
 
-This module provides a Tkinter-based dashboard for monitoring and demonstrating
-the NetFailover system:
-- Connection Status (Primary & Backup servers)
-- Heartbeat Monitor (Status, latency, missed heartbeat counter)
-- Failover Information (Active server, detection time, failover status)
-- Event Log (Timestamped system events)
-- Interactive Demonstration controls
+Features:
+- Live Interactive Network Topology Diagram (Canvas-based)
+- Dark-theme Datacenter/NOC visual aesthetics
+- Live Latency Gauge & Heartbeat Miss step-indicators
+- Real-time Failover Duration & Detection Timers
+- Syntax-highlighted Scrolled Event Log
+- Interactive Network Command Testing Panel
 """
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext
+import threading
+import time
 from datetime import datetime
 
-# Global references for dashboard widgets and state
-root = None
-lbl_primary_status = None
-lbl_backup_status = None
-lbl_active_server = None
-lbl_heartbeat_status = None
-lbl_response_time = None
-lbl_missed_count = None
-lbl_failover_status = None
-lbl_detection_time = None
-canvas_primary_dot = None
-canvas_backup_dot = None
-txt_event_log = None
+# Import the real NetFailover client engine and configuration
+from client import NetFailoverClient, SERVER_IP, SERVER_PORT, BACKUP_SERVER_IP, BACKUP_SERVER_PORT
 
-# Monitoring state flag
-is_monitoring = False
-demo_job = None
+# Global client and widget references
+client = None
+root = None
+
+# Statistics counters
+stats = {
+    "pings_sent": 0,
+    "pongs_received": 0,
+    "missed_count": 0,
+    "total_failovers": 0
+}
+
+# UI Widget References
+canvas_topo = None
+lbl_active_pill = None
+lbl_primary_pill = None
+lbl_backup_pill = None
+lbl_rtt_val = None
+lbl_det_val = None
+lbl_switch_val = None
+lbl_hb_status = None
+box_missed_1 = None
+box_missed_2 = None
+box_missed_3 = None
+lbl_stat_pings = None
+lbl_stat_pongs = None
+lbl_stat_failovers = None
+txt_event_log = None
+btn_start = None
+btn_stop = None
+entry_message = None
+
 
 def get_current_timestamp():
     """Returns formatted current timestamp string."""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now().strftime("%H:%M:%S")
 
-def add_log(message):
+
+def add_log(message, tag="INFO"):
     """
-    Appends a timestamped message to the scrolling Event Log area.
+    Appends a timestamped, color-tagged message to the scrolling Event Log area.
+    Thread-safe when called via root.after or on the main thread.
     """
     if txt_event_log is not None:
         timestamp = get_current_timestamp()
         log_entry = f"[{timestamp}] {message}\n"
         txt_event_log.configure(state="normal")
-        txt_event_log.insert(tk.END, log_entry)
+        txt_event_log.insert(tk.END, log_entry, tag)
         txt_event_log.see(tk.END)
         txt_event_log.configure(state="disabled")
 
+
 def clear_log():
-    """
-    Clears all messages from the Event Log area.
-    """
+    """Clears all messages from the Event Log area."""
     if txt_event_log is not None:
         txt_event_log.configure(state="normal")
         txt_event_log.delete("1.0", tk.END)
         txt_event_log.configure(state="disabled")
-        add_log("Event log cleared.")
+        add_log("Event log cleared.", "INFO")
 
-def draw_status_dot(canvas, color):
-    """Draws a clean colored status indicator circle on a Tkinter Canvas."""
-    canvas.delete("all")
-    canvas.create_oval(3, 3, 15, 15, fill=color, outline=color)
 
-def update_primary_status(status):
+def draw_topology(primary_status="OFFLINE", backup_status="STANDBY", active="PRIMARY"):
     """
-    Updates the Primary Server status label and visual indicator.
-    Accepts: 'ONLINE', 'OFFLINE', 'TIMEOUT'
+    Draws the live network topology diagram on the Canvas:
+    Client node on the left, Primary and Backup server nodes on the right,
+    with dynamic color-coded links showing active routing and failures.
     """
-    global lbl_primary_status, canvas_primary_dot
-    color_map = {
-        "ONLINE": "#2e7d32",   # Green
-        "OFFLINE": "#d32f2f",  # Red
-        "TIMEOUT": "#ed6c02"   # Orange
-    }
-    color = color_map.get(status, "#757575")
-    if lbl_primary_status:
-        lbl_primary_status.config(text=status, foreground=color)
-    if canvas_primary_dot:
-        draw_status_dot(canvas_primary_dot, color)
+    if canvas_topo is None:
+        return
 
-def update_backup_status(status):
-    """
-    Updates the Backup Server status label and visual indicator.
-    Accepts: 'STANDBY', 'ONLINE', 'OFFLINE'
-    """
-    global lbl_backup_status, canvas_backup_dot
-    color_map = {
-        "ONLINE": "#2e7d32",   # Green (Active)
-        "STANDBY": "#0288d1",  # Blue (Ready in standby)
-        "OFFLINE": "#d32f2f"   # Red
-    }
-    color = color_map.get(status, "#757575")
-    if lbl_backup_status:
-        lbl_backup_status.config(text=status, foreground=color)
-    if canvas_backup_dot:
-        draw_status_dot(canvas_backup_dot, color)
+    canvas_topo.delete("all")
+    w = canvas_topo.winfo_width() or 860
+    h = canvas_topo.winfo_height() or 140
 
-def update_active_server(server_name):
-    """
-    Updates the Active Server label display.
-    Accepts: 'PRIMARY' or 'BACKUP'
-    """
-    global lbl_active_server
-    color = "#1565c0" if server_name == "PRIMARY" else "#6a1b9a"
-    if lbl_active_server:
-        lbl_active_server.config(text=server_name, foreground=color)
+    # Coordinates
+    client_x, client_y = 90, h // 2
+    prim_x, prim_y = w - 110, 38
+    back_x, back_y = w - 110, h - 38
 
-def simulate_normal():
-    """
-    Demonstration Mode: Simulates normal healthy operation.
-    - Primary Server = ONLINE
-    - Backup Server  = STANDBY
-    - Active Server  = PRIMARY
-    - Heartbeat      = CONNECTED
-    - Failover       = NOT REQUIRED
-    """
-    update_primary_status("ONLINE")
-    update_backup_status("STANDBY")
-    update_active_server("PRIMARY")
+    # Link colors and styles
+    link_prim_color = "#334155"  # Slate inactive
+    link_prim_width = 2
+    link_prim_dash = (4, 4)
 
-    lbl_heartbeat_status.config(text="CONNECTED", foreground="#2e7d32")
-    lbl_response_time.config(text="1.15 ms")
-    lbl_missed_count.config(text="0 / 3", foreground="#2e7d32")
+    link_back_color = "#334155"
+    link_back_width = 2
+    link_back_dash = (4, 4)
 
-    lbl_failover_status.config(text="NOT REQUIRED", foreground="#2e7d32")
-    lbl_detection_time.config(text="0.00 s")
+    if primary_status == "ONLINE" and active == "PRIMARY":
+        link_prim_color = "#10b981"  # Emerald active
+        link_prim_width = 3
+        link_prim_dash = ()
+    elif primary_status in ("OFFLINE", "TIMEOUT"):
+        link_prim_color = "#ef4444"  # Red failed
+        link_prim_width = 3
+        link_prim_dash = (3, 3)
 
-    add_log("[DEMO] State set to NORMAL: Primary server ONLINE, Backup server STANDBY.")
+    if backup_status == "ONLINE" and active == "BACKUP":
+        link_back_color = "#10b981"  # Emerald active
+        link_back_width = 3
+        link_back_dash = ()
+    elif backup_status == "STANDBY":
+        link_back_color = "#38bdf8"  # Cyan standby
+        link_back_width = 2
+        link_back_dash = (6, 4)
 
-def simulate_failover():
-    """
-    Demonstration Mode: Simulates primary failure and automatic failover.
-    - Primary Server = OFFLINE
-    - Backup Server  = ONLINE
-    - Active Server  = BACKUP
-    - Heartbeat      = CONNECTED (to Backup)
-    - Failover       = COMPLETED
-    """
-    update_primary_status("OFFLINE")
-    update_backup_status("ONLINE")
-    update_active_server("BACKUP")
+    # Draw Link Lines
+    canvas_topo.create_line(client_x + 35, client_y, prim_x - 45, prim_y, fill=link_prim_color, width=link_prim_width, dash=link_prim_dash)
+    canvas_topo.create_line(client_x + 35, client_y, back_x - 45, back_y, fill=link_back_color, width=link_back_width, dash=link_back_dash)
 
-    lbl_heartbeat_status.config(text="CONNECTED (to Backup)", foreground="#2e7d32")
-    lbl_response_time.config(text="1.28 ms")
-    lbl_missed_count.config(text="0 / 3", foreground="#2e7d32")
+    def draw_node(x, y, label, sublabel, color, border_color):
+        # Card body
+        canvas_topo.create_rectangle(x - 55, y - 24, x + 55, y + 24, fill=color, outline=border_color, width=2)
+        canvas_topo.create_text(x, y - 7, text=label, fill="#ffffff", font=("Segoe UI", 9, "bold"))
+        canvas_topo.create_text(x, y + 9, text=sublabel, fill="#94a3b8", font=("Segoe UI", 8))
 
-    lbl_failover_status.config(text="COMPLETED (Switched to Backup)", foreground="#6a1b9a")
-    lbl_detection_time.config(text="4.02 s")
+    # Draw Client Node
+    draw_node(client_x, client_y, "CLIENT", "NetFailover App", "#1e293b", "#38bdf8")
 
-    add_log("[DEMO] Simulated failure: Primary heartbeat timed out (3 missed).")
-    add_log("[DEMO] Automatic failover triggered! Active server switched to BACKUP (127.0.0.1:5001).")
+    # Draw Primary Server Node
+    prim_bg = "#064e3b" if primary_status == "ONLINE" else "#450a0a"
+    prim_border = "#10b981" if primary_status == "ONLINE" else "#ef4444"
+    draw_node(prim_x, prim_y, f"PRIMARY :{SERVER_PORT}", f"[{primary_status}]", prim_bg, prim_border)
+
+    # Draw Backup Server Node
+    if backup_status == "ONLINE" and active == "BACKUP":
+        back_bg = "#064e3b"
+        back_border = "#10b981"
+    else:
+        back_bg = "#0c4a6e"
+        back_border = "#38bdf8"
+    draw_node(back_x, back_y, f"BACKUP :{BACKUP_SERVER_PORT}", f"[{backup_status}]", back_bg, back_border)
+
+
+def update_missed_blocks(missed_count):
+    """Updates the 3-step missed heartbeat visual indicator blocks."""
+    blocks = [box_missed_1, box_missed_2, box_missed_3]
+    for i, b in enumerate(blocks, start=1):
+        if b is None:
+            continue
+        if i <= missed_count:
+            if missed_count >= 3:
+                b.config(bg="#ef4444", fg="#ffffff")  # Red threshold reached
+            else:
+                b.config(bg="#f59e0b", fg="#ffffff")  # Amber warning
+        else:
+            b.config(bg="#1e293b", fg="#64748b")     # Grey idle
+
+
+def on_client_event(event_type, data):
+    """Thread-safe event dispatcher that marshals networking events to the GUI thread."""
+    if root is not None:
+        root.after(0, lambda: handle_gui_event(event_type, data))
+
+
+def handle_gui_event(event_type, data):
+    """Updates widgets, counters, topology, and logs on the main Tkinter thread."""
+    global stats
+
+    if event_type == "PRIMARY_CONNECTED":
+        lbl_primary_pill.config(text="ONLINE", bg="#065f46", fg="#34d399")
+        lbl_backup_pill.config(text="STANDBY", bg="#0c4a6e", fg="#38bdf8")
+        lbl_active_pill.config(text="PRIMARY SERVER", bg="#1e3a8a", fg="#60a5fa")
+
+        lbl_hb_status.config(text="ACTIVE HEARTBEAT", fg="#34d399")
+        update_missed_blocks(0)
+        lbl_det_val.config(text="0.00 s")
+        lbl_switch_val.config(text="0.00 ms")
+
+        draw_topology("ONLINE", "STANDBY", "PRIMARY")
+        add_log(f"Connected to Primary Server at {data.get('ip')}:{data.get('port')}.", "SUCCESS")
+        btn_start.config(state="disabled")
+        btn_stop.config(state="normal")
+
+    elif event_type == "HEARTBEAT_PING":
+        stats["pings_sent"] += 1
+        lbl_stat_pings.config(text=str(stats["pings_sent"]))
+        add_log(f"PING probe -> {data.get('active_server')}", "PING")
+
+    elif event_type == "HEARTBEAT_PONG":
+        stats["pongs_received"] += 1
+        lbl_stat_pongs.config(text=str(stats["pongs_received"]))
+        rtt = data.get("response_time", 0.0)
+        lbl_rtt_val.config(text=f"{rtt:.2f} ms")
+        update_missed_blocks(0)
+        lbl_hb_status.config(text=f"CONNECTED ({data.get('active_server')})", fg="#34d399")
+        add_log(f"PONG received from {data.get('active_server')} (RTT: {rtt:.2f} ms)", "SUCCESS")
+
+    elif event_type == "HEARTBEAT_MISSED":
+        missed = data.get("missed_count", 0)
+        update_missed_blocks(missed)
+        active = data.get("active_server", "PRIMARY")
+        lbl_hb_status.config(text=f"PROBE TIMEOUT ({missed}/3)", fg="#f59e0b")
+        add_log(f"Heartbeat probe {missed}/3 timed out from {active} server!", "WARN")
+
+    elif event_type == "FAILURE_DETECTED":
+        det_time = data.get("detection_time", 0.0)
+        lbl_primary_pill.config(text="OFFLINE", bg="#7f1d1d", fg="#f87171")
+        lbl_det_val.config(text=f"{det_time:.2f} s")
+        lbl_hb_status.config(text="PRIMARY FAILED", fg="#ef4444")
+        draw_topology("OFFLINE", "STANDBY", "PRIMARY")
+        add_log(f"FAULT DETECTED: Primary server failed! (Detection time: {det_time:.2f} s)", "FAIL")
+
+    elif event_type == "FAILOVER_STARTED":
+        lbl_hb_status.config(text="FAILOVER IN PROGRESS...", fg="#f59e0b")
+        add_log(f"Initiating automatic socket failover to Backup ({BACKUP_SERVER_IP}:{BACKUP_SERVER_PORT})...", "FAILOVER")
+
+    elif event_type == "BACKUP_CONNECTED":
+        lbl_backup_pill.config(text="ONLINE (ACTIVE)", bg="#065f46", fg="#34d399")
+
+    elif event_type == "FAILOVER_COMPLETED":
+        stats["total_failovers"] += 1
+        lbl_stat_failovers.config(text=str(stats["total_failovers"]))
+
+        det_time = data.get("detection_time", 0.0)
+        dur = data.get("failover_duration", 0.0)
+
+        lbl_primary_pill.config(text="OFFLINE", bg="#7f1d1d", fg="#f87171")
+        lbl_backup_pill.config(text="ONLINE", bg="#065f46", fg="#34d399")
+        lbl_active_pill.config(text="BACKUP SERVER", bg="#581c87", fg="#c084fc")
+
+        lbl_hb_status.config(text="CONNECTED (Backup Active)", fg="#34d399")
+        update_missed_blocks(0)
+        lbl_det_val.config(text=f"{det_time:.2f} s")
+        lbl_switch_val.config(text=f"{dur:.2f} ms")
+
+        draw_topology("OFFLINE", "ONLINE", "BACKUP")
+        add_log(f"FAILOVER COMPLETED: Switched to Backup Server at {data.get('ip')}:{data.get('port')}.", "FAILOVER")
+        add_log(f"Reconnection TCP handshake finished in {dur:.2f} ms.", "SUCCESS")
+
+    elif event_type == "CONNECTION_FAILED":
+        msg = data.get("message", "Connection failed.")
+        lbl_hb_status.config(text="DISCONNECTED", fg="#ef4444")
+        draw_topology("OFFLINE", "OFFLINE", "NONE")
+        add_log(f"Connection error: {msg}", "FAIL")
+        btn_start.config(state="normal")
+        btn_stop.config(state="disabled")
+
+    elif event_type == "DISCONNECTED":
+        lbl_hb_status.config(text="STANDBY / STOPPED", fg="#94a3b8")
+        draw_topology("OFFLINE", "STANDBY", "NONE")
+        add_log("Monitoring stopped and client disconnected.", "INFO")
+        btn_start.config(state="normal")
+        btn_stop.config(state="disabled")
+
 
 def start_monitoring():
-    """Starts simulated monitoring loop for demonstration."""
-    global is_monitoring, demo_job
-    if is_monitoring:
+    """Connects to Primary Server and starts heartbeats in background thread."""
+    global client
+    if client and client.is_connected:
         return
-    is_monitoring = True
-    add_log("[MONITOR] Heartbeat monitoring started (Interval: 2.0s).")
 
-    def heartbeat_tick():
-        global demo_job
-        if not is_monitoring:
-            return
-        # Subtle simulation log
-        active = lbl_active_server.cget("text")
-        add_log(f"[HEARTBEAT] PING -> {active} | PONG received (Response time: 1.20 ms)")
-        demo_job = root.after(2000, heartbeat_tick)
+    btn_start.config(state="disabled")
+    btn_stop.config(state="normal")
+    add_log("Connecting to Primary Server...", "INFO")
 
-    demo_job = root.after(2000, heartbeat_tick)
+    def connect_worker():
+        global client
+        client = NetFailoverClient(event_callback=on_client_event)
+        success = client.connect()
+        if success:
+            client.start_heartbeat()
+        else:
+            def on_fail():
+                btn_start.config(state="normal")
+                btn_stop.config(state="disabled")
+            root.after(0, on_fail)
+
+    threading.Thread(target=connect_worker, daemon=True).start()
+
 
 def stop_monitoring():
-    """Stops simulated monitoring loop."""
-    global is_monitoring, demo_job
-    if not is_monitoring:
+    """Disconnects client cleanly and stops heartbeat worker."""
+    global client
+    btn_start.config(state="normal")
+    btn_stop.config(state="disabled")
+
+    def disconnect_worker():
+        global client
+        if client:
+            client.disconnect()
+            client = None
+
+    threading.Thread(target=disconnect_worker, daemon=True).start()
+
+
+def send_gui_command(command_text):
+    """Sends interactive command through active socket without blocking GUI."""
+    global client
+    if not client or not client.is_connected:
+        add_log("Cannot send: Client is not connected to any server.", "FAIL")
         return
-    is_monitoring = False
-    if demo_job:
-        root.after_cancel(demo_job)
-        demo_job = None
-    add_log("[MONITOR] Heartbeat monitoring stopped.")
+
+    cmd = command_text.strip()
+    if not cmd:
+        return
+
+    def command_worker():
+        add_log(f"TX -> '{cmd}' to {client.active_server}", "CMD")
+        response = client.send_command(cmd)
+        if response:
+            root.after(0, lambda: add_log(f"RX <- {response}", "SUCCESS"))
+        else:
+            root.after(0, lambda: add_log(f"RX <- No response from {client.active_server}!", "FAIL"))
+
+    threading.Thread(target=command_worker, daemon=True).start()
+
+
+def on_send_message():
+    """Handles sending text from the message entry box."""
+    global entry_message
+    if entry_message:
+        text = entry_message.get().strip()
+        if text:
+            send_gui_command(f"MESSAGE {text}")
+
+
+def on_window_close():
+    """Ensures clean socket teardown on exit."""
+    global client
+    if client:
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+    if root:
+        root.destroy()
+
 
 def create_dashboard():
-    """
-    Constructs the main dashboard window, layout, and widgets using Tkinter.
-    """
-    global root
-    global lbl_primary_status, lbl_backup_status, lbl_active_server
-    global lbl_heartbeat_status, lbl_response_time, lbl_missed_count
-    global lbl_failover_status, lbl_detection_time
-    global canvas_primary_dot, canvas_backup_dot, txt_event_log
+    """Constructs the high-tech NOC Tkinter dashboard."""
+    global root, canvas_topo
+    global lbl_active_pill, lbl_primary_pill, lbl_backup_pill
+    global lbl_rtt_val, lbl_det_val, lbl_switch_val, lbl_hb_status
+    global box_missed_1, box_missed_2, box_missed_3
+    global lbl_stat_pings, lbl_stat_pongs, lbl_stat_failovers
+    global txt_event_log, btn_start, btn_stop, entry_message
 
     root = tk.Tk()
-    root.title("NetFailover - Network Fault Detection & Automatic Failover")
-    root.geometry("900x600")
-    root.minsize(850, 550)
+    root.title("NetFailover NOC - Computer Networks Fault Detection & Failover")
+    root.geometry("980x720")
+    root.minsize(920, 640)
+    root.protocol("WM_DELETE_WINDOW", on_window_close)
 
-    # Style configuration
-    style = ttk.Style()
-    style.theme_use("clam")
+    # Dark NOC Palette
+    bg_dark = "#0b1120"
+    card_bg = "#1e293b"
+    border_color = "#334155"
+    text_primary = "#f8fafc"
+    text_secondary = "#94a3b8"
 
-    # Background color configuration
-    bg_main = "#f4f6f9"
-    card_bg = "#ffffff"
-    root.configure(bg=bg_main)
+    root.configure(bg=bg_dark)
 
-    # Main Container Frame
-    main_frame = tk.Frame(root, bg=bg_main, padx=16, pady=12)
+    main_frame = tk.Frame(root, bg=bg_dark, padx=16, pady=12)
     main_frame.pack(fill=tk.BOTH, expand=True)
 
-    # ==========================================
-    # HEADER SECTION
-    # ==========================================
-    header_frame = tk.Frame(main_frame, bg="#1a237e", padx=16, pady=12)
-    header_frame.pack(fill=tk.X, pady=(0, 12))
+    # 1. TOP HEADER & TITLE
+    header = tk.Frame(main_frame, bg=card_bg, padx=16, pady=12, highlightthickness=1, highlightbackground=border_color)
+    header.pack(fill=tk.X, pady=(0, 10))
 
-    lbl_title = tk.Label(
-        header_frame,
-        text="NetFailover - Network Fault Detection & Automatic Failover",
-        font=("Segoe UI", 16, "bold"),
-        fg="#ffffff",
-        bg="#1a237e"
-    )
-    lbl_title.pack(anchor="w")
+    title_box = tk.Frame(header, bg=card_bg)
+    title_box.pack(side=tk.LEFT)
 
-    lbl_subtitle = tk.Label(
-        header_frame,
-        text="Computer Networks Laboratory Project • Socket Programming & High Availability Simulation",
+    tk.Label(
+        title_box,
+        text="NETFAILOVER NOC MONITOR",
+        font=("Segoe UI", 14, "bold"),
+        fg="#38bdf8",
+        bg=card_bg
+    ).pack(anchor="w")
+
+    tk.Label(
+        title_box,
+        text="Network Fault Detection & Automatic Server Failover System • TCP Socket Layer",
         font=("Segoe UI", 9),
-        fg="#c5cae9",
-        bg="#1a237e"
+        fg=text_secondary,
+        bg=card_bg
+    ).pack(anchor="w")
+
+    # Header Active Pill
+    active_frame = tk.Frame(header, bg=card_bg)
+    active_frame.pack(side=tk.RIGHT)
+    tk.Label(active_frame, text="ROUTED NODE:", font=("Segoe UI", 8, "bold"), fg=text_secondary, bg=card_bg).pack(side=tk.LEFT, padx=6)
+    lbl_active_pill = tk.Label(active_frame, text="STANDBY", font=("Segoe UI", 9, "bold"), bg="#334155", fg="#cbd5e1", padx=10, pady=3)
+    lbl_active_pill.pack(side=tk.LEFT)
+
+    # 2. TOPOLOGY DIAGRAM CANVAS
+    topo_card = tk.LabelFrame(
+        main_frame,
+        text="  Network Topology & Real-Time Flow  ",
+        font=("Segoe UI", 9, "bold"),
+        fg="#38bdf8",
+        bg=card_bg,
+        padx=8,
+        pady=4,
+        bd=1,
+        relief="solid"
     )
-    lbl_subtitle.pack(anchor="w")
+    topo_card.pack(fill=tk.X, pady=(0, 10))
 
-    # ==========================================
-    # CARDS GRID (A, B, C)
-    # ==========================================
-    cards_frame = tk.Frame(main_frame, bg=bg_main)
-    cards_frame.pack(fill=tk.X, pady=(0, 10))
-    cards_frame.columnconfigure(0, weight=1)
-    cards_frame.columnconfigure(1, weight=1)
-    cards_frame.columnconfigure(2, weight=1)
+    canvas_topo = tk.Canvas(topo_card, height=105, bg="#0f172a", highlightthickness=0)
+    canvas_topo.pack(fill=tk.X, expand=True)
+    canvas_topo.bind("<Configure>", lambda e: draw_topology())
 
-    # Helper function to create clean card frames
-    def make_card(parent, title_text, col):
-        card = tk.LabelFrame(
+    # 3. METRICS GRID (Cards A, B, C)
+    grid_frame = tk.Frame(main_frame, bg=bg_dark)
+    grid_frame.pack(fill=tk.X, pady=(0, 10))
+    grid_frame.columnconfigure(0, weight=1)
+    grid_frame.columnconfigure(1, weight=1)
+    grid_frame.columnconfigure(2, weight=1)
+
+    def make_section(parent, title, col):
+        frame = tk.LabelFrame(
             parent,
-            text=f"  {title_text}  ",
-            font=("Segoe UI", 10, "bold"),
-            fg="#1a237e",
+            text=f"  {title}  ",
+            font=("Segoe UI", 9, "bold"),
+            fg="#38bdf8",
             bg=card_bg,
             padx=12,
-            pady=10,
-            relief="solid",
-            bd=1
+            pady=8,
+            bd=1,
+            relief="solid"
         )
-        card.grid(row=0, column=col, sticky="nsew", padx=6)
-        return card
+        frame.grid(row=0, column=col, sticky="nsew", padx=4)
+        return frame
 
-    # --- CARD A: CONNECTION STATUS ---
-    card_a = make_card(cards_frame, "A. Connection Status", 0)
+    # CARD 1: SERVERS HEALTH
+    c1 = make_section(grid_frame, "1. Node Connectivity", 0)
 
     # Primary Row
-    row_prim = tk.Frame(card_a, bg=card_bg)
-    row_prim.pack(fill=tk.X, pady=3)
-    tk.Label(row_prim, text="Primary Server (5000):", font=("Segoe UI", 9), bg=card_bg).pack(side=tk.LEFT)
-    lbl_primary_status = tk.Label(row_prim, text="ONLINE", font=("Segoe UI", 9, "bold"), fg="#2e7d32", bg=card_bg)
-    lbl_primary_status.pack(side=tk.RIGHT)
-    canvas_primary_dot = tk.Canvas(row_prim, width=18, height=18, bg=card_bg, highlightthickness=0)
-    canvas_primary_dot.pack(side=tk.RIGHT, padx=4)
-    draw_status_dot(canvas_primary_dot, "#2e7d32")
+    r1 = tk.Frame(c1, bg=card_bg)
+    r1.pack(fill=tk.X, pady=3)
+    tk.Label(r1, text="Primary (:5000):", font=("Segoe UI", 9), fg=text_secondary, bg=card_bg).pack(side=tk.LEFT)
+    lbl_primary_pill = tk.Label(r1, text="OFFLINE", font=("Segoe UI", 8, "bold"), bg="#334155", fg="#94a3b8", padx=8, pady=1)
+    lbl_primary_pill.pack(side=tk.RIGHT)
 
     # Backup Row
-    row_back = tk.Frame(card_a, bg=card_bg)
-    row_back.pack(fill=tk.X, pady=3)
-    tk.Label(row_back, text="Backup Server (5001):", font=("Segoe UI", 9), bg=card_bg).pack(side=tk.LEFT)
-    lbl_backup_status = tk.Label(row_back, text="STANDBY", font=("Segoe UI", 9, "bold"), fg="#0288d1", bg=card_bg)
-    lbl_backup_status.pack(side=tk.RIGHT)
-    canvas_backup_dot = tk.Canvas(row_back, width=18, height=18, bg=card_bg, highlightthickness=0)
-    canvas_backup_dot.pack(side=tk.RIGHT, padx=4)
-    draw_status_dot(canvas_backup_dot, "#0288d1")
+    r2 = tk.Frame(c1, bg=card_bg)
+    r2.pack(fill=tk.X, pady=3)
+    tk.Label(r2, text="Backup (:5001):", font=("Segoe UI", 9), fg=text_secondary, bg=card_bg).pack(side=tk.LEFT)
+    lbl_backup_pill = tk.Label(r2, text="STANDBY", font=("Segoe UI", 8, "bold"), bg="#0c4a6e", fg="#38bdf8", padx=8, pady=1)
+    lbl_backup_pill.pack(side=tk.RIGHT)
 
-    # Active Server Row
-    row_active = tk.Frame(card_a, bg=card_bg)
-    row_active.pack(fill=tk.X, pady=3)
-    tk.Label(row_active, text="Current Active Server:", font=("Segoe UI", 9), bg=card_bg).pack(side=tk.LEFT)
-    lbl_active_server = tk.Label(row_active, text="PRIMARY", font=("Segoe UI", 9, "bold"), fg="#1565c0", bg=card_bg)
-    lbl_active_server.pack(side=tk.RIGHT)
-
-    # --- CARD B: HEARTBEAT MONITOR ---
-    card_b = make_card(cards_frame, "B. Heartbeat Monitor", 1)
+    # CARD 2: HEARTBEAT TELEMETRY
+    c2 = make_section(grid_frame, "2. Heartbeat Telemetry", 1)
 
     # Heartbeat Status
-    row_hb_status = tk.Frame(card_b, bg=card_bg)
-    row_hb_status.pack(fill=tk.X, pady=3)
-    tk.Label(row_hb_status, text="Heartbeat Status:", font=("Segoe UI", 9), bg=card_bg).pack(side=tk.LEFT)
-    lbl_heartbeat_status = tk.Label(row_hb_status, text="CONNECTED", font=("Segoe UI", 9, "bold"), fg="#2e7d32", bg=card_bg)
-    lbl_heartbeat_status.pack(side=tk.RIGHT)
+    r3 = tk.Frame(c2, bg=card_bg)
+    r3.pack(fill=tk.X, pady=2)
+    tk.Label(r3, text="Status:", font=("Segoe UI", 9), fg=text_secondary, bg=card_bg).pack(side=tk.LEFT)
+    lbl_hb_status = tk.Label(r3, text="DISCONNECTED", font=("Segoe UI", 8, "bold"), fg="#94a3b8", bg=card_bg)
+    lbl_hb_status.pack(side=tk.RIGHT)
 
-    # Response Time
-    row_rtt = tk.Frame(card_b, bg=card_bg)
-    row_rtt.pack(fill=tk.X, pady=3)
-    tk.Label(row_rtt, text="Response Time (RTT):", font=("Segoe UI", 9), bg=card_bg).pack(side=tk.LEFT)
-    lbl_response_time = tk.Label(row_rtt, text="1.15 ms", font=("Segoe UI", 9, "bold"), fg="#37474f", bg=card_bg)
-    lbl_response_time.pack(side=tk.RIGHT)
+    # RTT Latency
+    r4 = tk.Frame(c2, bg=card_bg)
+    r4.pack(fill=tk.X, pady=2)
+    tk.Label(r4, text="Round-Trip Time (RTT):", font=("Segoe UI", 9), fg=text_secondary, bg=card_bg).pack(side=tk.LEFT)
+    lbl_rtt_val = tk.Label(r4, text="0.00 ms", font=("Segoe UI", 9, "bold"), fg="#34d399", bg=card_bg)
+    lbl_rtt_val.pack(side=tk.RIGHT)
 
-    # Missed Heartbeat Count
-    row_missed = tk.Frame(card_b, bg=card_bg)
-    row_missed.pack(fill=tk.X, pady=3)
-    tk.Label(row_missed, text="Missed Heartbeats:", font=("Segoe UI", 9), bg=card_bg).pack(side=tk.LEFT)
-    lbl_missed_count = tk.Label(row_missed, text="0 / 3", font=("Segoe UI", 9, "bold"), fg="#2e7d32", bg=card_bg)
-    lbl_missed_count.pack(side=tk.RIGHT)
+    # Missed Blocks
+    r5 = tk.Frame(c2, bg=card_bg)
+    r5.pack(fill=tk.X, pady=2)
+    tk.Label(r5, text="Missed Probes:", font=("Segoe UI", 9), fg=text_secondary, bg=card_bg).pack(side=tk.LEFT)
+    box_missed_3 = tk.Label(r5, text=" 3 ", font=("Segoe UI", 8, "bold"), bg="#1e293b", fg="#64748b", relief="solid", bd=1)
+    box_missed_3.pack(side=tk.RIGHT, padx=1)
+    box_missed_2 = tk.Label(r5, text=" 2 ", font=("Segoe UI", 8, "bold"), bg="#1e293b", fg="#64748b", relief="solid", bd=1)
+    box_missed_2.pack(side=tk.RIGHT, padx=1)
+    box_missed_1 = tk.Label(r5, text=" 1 ", font=("Segoe UI", 8, "bold"), bg="#1e293b", fg="#64748b", relief="solid", bd=1)
+    box_missed_1.pack(side=tk.RIGHT, padx=1)
 
-    # --- CARD C: FAILOVER INFORMATION ---
-    card_c = make_card(cards_frame, "C. Failover Information", 2)
+    # CARD 3: FAILOVER BENCHMARKS
+    c3 = make_section(grid_frame, "3. Failover Metrics", 2)
 
     # Detection Time
-    row_det_time = tk.Frame(card_c, bg=card_bg)
-    row_det_time.pack(fill=tk.X, pady=3)
-    tk.Label(row_det_time, text="Failure Detection Time:", font=("Segoe UI", 9), bg=card_bg).pack(side=tk.LEFT)
-    lbl_detection_time = tk.Label(row_det_time, text="0.00 s", font=("Segoe UI", 9, "bold"), fg="#37474f", bg=card_bg)
-    lbl_detection_time.pack(side=tk.RIGHT)
+    r6 = tk.Frame(c3, bg=card_bg)
+    r6.pack(fill=tk.X, pady=3)
+    tk.Label(r6, text="Fault Detection Time:", font=("Segoe UI", 9), fg=text_secondary, bg=card_bg).pack(side=tk.LEFT)
+    lbl_det_val = tk.Label(r6, text="0.00 s", font=("Segoe UI", 9, "bold"), fg="#38bdf8", bg=card_bg)
+    lbl_det_val.pack(side=tk.RIGHT)
 
-    # Failover Status
-    row_failover = tk.Frame(card_c, bg=card_bg)
-    row_failover.pack(fill=tk.X, pady=3)
-    tk.Label(row_failover, text="Failover Status:", font=("Segoe UI", 9), bg=card_bg).pack(side=tk.LEFT)
-    lbl_failover_status = tk.Label(row_failover, text="NOT REQUIRED", font=("Segoe UI", 9, "bold"), fg="#2e7d32", bg=card_bg)
-    lbl_failover_status.pack(side=tk.RIGHT)
+    # Switchover Handshake
+    r7 = tk.Frame(c3, bg=card_bg)
+    r7.pack(fill=tk.X, pady=3)
+    tk.Label(r7, text="Reconnection Handshake:", font=("Segoe UI", 9), fg=text_secondary, bg=card_bg).pack(side=tk.LEFT)
+    lbl_switch_val = tk.Label(r7, text="0.00 ms", font=("Segoe UI", 9, "bold"), fg="#c084fc", bg=card_bg)
+    lbl_switch_val.pack(side=tk.RIGHT)
 
-    # Protocol summary
-    row_proto = tk.Frame(card_c, bg=card_bg)
-    row_proto.pack(fill=tk.X, pady=3)
-    tk.Label(row_proto, text="Failover Trigger:", font=("Segoe UI", 9), bg=card_bg).pack(side=tk.LEFT)
-    tk.Label(row_proto, text="3 Missed PONGs", font=("Segoe UI", 9), fg="#616161", bg=card_bg).pack(side=tk.RIGHT)
+    # 4. CONTROL ACTION BAR & COMMAND PANEL
+    actions_card = tk.LabelFrame(
+        main_frame,
+        text="  Interactive Network Controls & Testing  ",
+        font=("Segoe UI", 9, "bold"),
+        fg="#38bdf8",
+        bg=card_bg,
+        padx=10,
+        pady=8,
+        bd=1,
+        relief="solid"
+    )
+    actions_card.pack(fill=tk.X, pady=(0, 10))
 
-    # ==========================================
-    # ACTION & DEMO BUTTONS BAR
-    # ==========================================
-    btn_bar = tk.Frame(main_frame, bg=bg_main)
-    btn_bar.pack(fill=tk.X, pady=(0, 10))
-
+    # Controls Row
     btn_start = tk.Button(
-        btn_bar,
+        actions_card,
         text="▶ START MONITORING",
         font=("Segoe UI", 9, "bold"),
-        bg="#2e7d32",
+        bg="#059669",
         fg="#ffffff",
-        activebackground="#1b5e20",
+        activebackground="#047857",
         activeforeground="#ffffff",
-        padx=12,
-        pady=5,
         relief="flat",
+        padx=10,
+        pady=4,
         cursor="hand2",
         command=start_monitoring
     )
     btn_start.pack(side=tk.LEFT, padx=(0, 6))
 
     btn_stop = tk.Button(
-        btn_bar,
-        text="⏹ STOP MONITORING",
+        actions_card,
+        text="⏹ STOP",
         font=("Segoe UI", 9, "bold"),
-        bg="#c62828",
+        bg="#dc2626",
         fg="#ffffff",
-        activebackground="#b71c1c",
+        activebackground="#b91c1c",
         activeforeground="#ffffff",
-        padx=12,
-        pady=5,
         relief="flat",
+        padx=10,
+        pady=4,
         cursor="hand2",
+        state="disabled",
         command=stop_monitoring
     )
-    btn_stop.pack(side=tk.LEFT, padx=(0, 12))
+    btn_stop.pack(side=tk.LEFT, padx=(0, 14))
 
-    # Demo Simulation Buttons
-    btn_sim_normal = tk.Button(
-        btn_bar,
-        text="✔ SIMULATE NORMAL",
-        font=("Segoe UI", 9),
-        bg="#e0e0e0",
-        fg="#212121",
-        padx=10,
-        pady=5,
-        relief="groove",
+    # Separator
+    tk.Label(actions_card, text="|", fg="#475569", bg=card_bg).pack(side=tk.LEFT, padx=(0, 10))
+
+    # Test Commands
+    tk.Button(
+        actions_card,
+        text="STATUS",
+        font=("Segoe UI", 8, "bold"),
+        bg="#0284c7",
+        fg="#ffffff",
+        relief="flat",
+        padx=8,
+        pady=4,
         cursor="hand2",
-        command=simulate_normal
-    )
-    btn_sim_normal.pack(side=tk.LEFT, padx=(0, 6))
+        command=lambda: send_gui_command("STATUS")
+    ).pack(side=tk.LEFT, padx=(0, 4))
 
-    btn_sim_failover = tk.Button(
-        btn_bar,
-        text="⚡ SIMULATE FAILOVER",
-        font=("Segoe UI", 9),
-        bg="#fff3e0",
-        fg="#e65100",
-        padx=10,
-        pady=5,
-        relief="groove",
+    tk.Button(
+        actions_card,
+        text="TIME",
+        font=("Segoe UI", 8, "bold"),
+        bg="#0284c7",
+        fg="#ffffff",
+        relief="flat",
+        padx=8,
+        pady=4,
         cursor="hand2",
-        command=simulate_failover
-    )
-    btn_sim_failover.pack(side=tk.LEFT, padx=(0, 6))
+        command=lambda: send_gui_command("TIME")
+    ).pack(side=tk.LEFT, padx=(0, 10))
 
-    btn_clear = tk.Button(
-        btn_bar,
-        text="🗑 CLEAR LOG",
-        font=("Segoe UI", 9),
-        bg="#eeeeee",
-        fg="#424242",
-        padx=10,
-        pady=5,
-        relief="groove",
+    # Message input
+    tk.Label(actions_card, text="Payload:", font=("Segoe UI", 8), fg=text_secondary, bg=card_bg).pack(side=tk.LEFT, padx=(0, 4))
+    entry_message = tk.Entry(actions_card, font=("Segoe UI", 9), bg="#0f172a", fg="#f8fafc", insertbackground="#ffffff", relief="solid", bd=1, width=22)
+    entry_message.pack(side=tk.LEFT, padx=(0, 6))
+    entry_message.insert(0, "Test Packet")
+
+    tk.Button(
+        actions_card,
+        text="SEND",
+        font=("Segoe UI", 8, "bold"),
+        bg="#7c3aed",
+        fg="#ffffff",
+        relief="flat",
+        padx=8,
+        pady=4,
+        cursor="hand2",
+        command=on_send_message
+    ).pack(side=tk.LEFT)
+
+    entry_message.bind("<Return>", lambda e: on_send_message())
+
+    # Clear Log Button
+    tk.Button(
+        actions_card,
+        text="CLEAR LOG",
+        font=("Segoe UI", 8),
+        bg="#334155",
+        fg="#cbd5e1",
+        relief="flat",
+        padx=8,
+        pady=4,
         cursor="hand2",
         command=clear_log
-    )
-    btn_clear.pack(side=tk.RIGHT)
+    ).pack(side=tk.RIGHT)
 
-    # ==========================================
-    # CARD D: EVENT LOG
-    # ==========================================
+    # 5. REAL-TIME EVENT LOG
     log_card = tk.LabelFrame(
         main_frame,
-        text="  D. Event Log  ",
-        font=("Segoe UI", 10, "bold"),
-        fg="#1a237e",
+        text="  Real-Time Socket Event Log  ",
+        font=("Segoe UI", 9, "bold"),
+        fg="#38bdf8",
         bg=card_bg,
         padx=8,
-        pady=8,
-        relief="solid",
-        bd=1
+        pady=6,
+        bd=1,
+        relief="solid"
     )
-    log_card.pack(fill=tk.BOTH, expand=True)
+    log_card.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
     txt_event_log = scrolledtext.ScrolledText(
         log_card,
         wrap=tk.WORD,
         font=("Consolas", 9),
-        bg="#1e1e1e",
-        fg="#d4d4d4",
-        insertbackground="#ffffff",
+        bg="#090d16",
+        fg="#e2e8f0",
+        insertbackground="#38bdf8",
         bd=0,
         padx=8,
         pady=8
     )
     txt_event_log.pack(fill=tk.BOTH, expand=True)
 
-    # Initial boot log entries
-    add_log("NetFailover Dashboard initialized.")
-    add_log("Primary Server configured at 127.0.0.1:5000 (ONLINE).")
-    add_log("Backup Server configured at 127.0.0.1:5001 (STANDBY).")
-    add_log("Heartbeat mechanism ready: PING/PONG interval = 2s, timeout = 3s, threshold = 3 misses.")
+    # Syntax Highlighting Tags
+    txt_event_log.tag_config("INFO", foreground="#94a3b8")
+    txt_event_log.tag_config("PING", foreground="#38bdf8")
+    txt_event_log.tag_config("SUCCESS", foreground="#34d399")
+    txt_event_log.tag_config("WARN", foreground="#fbbf24")
+    txt_event_log.tag_config("FAIL", foreground="#f87171")
+    txt_event_log.tag_config("FAILOVER", foreground="#c084fc")
+    txt_event_log.tag_config("CMD", foreground="#67e8f9")
 
+    # 6. BOTTOM TELEMETRY STATUS BAR
+    bar = tk.Frame(main_frame, bg=card_bg, padx=12, pady=4, highlightthickness=1, highlightbackground=border_color)
+    bar.pack(fill=tk.X)
+
+    tk.Label(bar, text="Pings Sent:", font=("Segoe UI", 8), fg=text_secondary, bg=card_bg).pack(side=tk.LEFT)
+    lbl_stat_pings = tk.Label(bar, text="0", font=("Segoe UI", 8, "bold"), fg="#38bdf8", bg=card_bg)
+    lbl_stat_pings.pack(side=tk.LEFT, padx=(2, 16))
+
+    tk.Label(bar, text="Pongs Received:", font=("Segoe UI", 8), fg=text_secondary, bg=card_bg).pack(side=tk.LEFT)
+    lbl_stat_pongs = tk.Label(bar, text="0", font=("Segoe UI", 8, "bold"), fg="#34d399", bg=card_bg)
+    lbl_stat_pongs.pack(side=tk.LEFT, padx=(2, 16))
+
+    tk.Label(bar, text="Failover Count:", font=("Segoe UI", 8), fg=text_secondary, bg=card_bg).pack(side=tk.LEFT)
+    lbl_stat_failovers = tk.Label(bar, text="0", font=("Segoe UI", 8, "bold"), fg="#c084fc", bg=card_bg)
+    lbl_stat_failovers.pack(side=tk.LEFT, padx=(2, 16))
+
+    tk.Label(bar, text="Protocol: TCP (SOCK_STREAM) | Interval: 2.0s | Max Miss: 3", font=("Segoe UI", 8), fg="#64748b", bg=card_bg).pack(side=tk.RIGHT)
+
+    # Initial Log Messages
+    add_log("NetFailover High-Availability NOC Dashboard initialized.", "INFO")
+    add_log(f"Primary Server target : {SERVER_IP}:{SERVER_PORT}", "INFO")
+    add_log(f"Backup Server target  : {BACKUP_SERVER_IP}:{BACKUP_SERVER_PORT}", "INFO")
+    add_log("Click '▶ START MONITORING' to initiate TCP handshake and heartbeat loop.", "INFO")
+
+    draw_topology()
     return root
+
 
 if __name__ == "__main__":
     app = create_dashboard()
