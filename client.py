@@ -1,226 +1,436 @@
+"""
+NetFailover - Client Networking Engine & CLI
+Computer Networks Fault Detection & Automatic Failover System
+
+Implements the NetFailoverClient class with:
+- TCP connection management
+- Thread-safe background heartbeat probing (PING/PONG)
+- Round-trip time (RTT) latency measurement
+- Missed heartbeat tracking (threshold = 3)
+- Automatic failover reconnection to Backup Server
+- Detection time and failover duration measurement
+- Event notification callback mechanism for UI integration
+- Standalone CLI interactive loop
+"""
+
 import socket
 import threading
 import time
 
-# Primary Server connection configuration
-SERVER_IP = "127.0.0.1"
-SERVER_PORT = 5000
+# Import configuration with safe fallback
+try:
+    from config import (
+        SERVER_IP,
+        PRIMARY_PORT,
+        BACKUP_PORT,
+        HEARTBEAT_INTERVAL,
+        SOCKET_TIMEOUT,
+        MAX_MISSED_HEARTBEATS,
+        BUFFER_SIZE,
+    )
+    SERVER_PORT = PRIMARY_PORT
+    BACKUP_SERVER_IP = SERVER_IP
+    BACKUP_SERVER_PORT = BACKUP_PORT
+except ImportError:
+    SERVER_IP = "127.0.0.1"
+    SERVER_PORT = 5000
+    BACKUP_SERVER_IP = "127.0.0.1"
+    BACKUP_SERVER_PORT = 5001
+    HEARTBEAT_INTERVAL = 2
+    SOCKET_TIMEOUT = 3.0
+    MAX_MISSED_HEARTBEATS = 3
+    BUFFER_SIZE = 1024
 
-# Backup Server connection configuration
-BACKUP_SERVER_IP = "127.0.0.1"
-BACKUP_SERVER_PORT = 5001
-
-# Heartbeat & Fault Detection configuration
-HEARTBEAT_INTERVAL = 2       # Send PING every 2 seconds
-SOCKET_TIMEOUT = 3.0         # Timeout in seconds for socket operations
-MAX_MISSED_HEARTBEATS = 3    # Consecutive missed heartbeats before declaring failure
 
 def display_connection_status(conn):
-    """
-    Displays a formatted status banner showing active server connection info.
-    """
-    server_name = conn.get("server", "PRIMARY")
-    ip = conn.get("ip", SERVER_IP)
-    port = conn.get("port", SERVER_PORT)
-    status = "ONLINE" if conn.get("alive", True) else "OFFLINE"
+    """Displays a formatted status banner showing active server connection info."""
+    if isinstance(conn, dict):
+        server_name = conn.get("server", conn.get("active_server", "PRIMARY"))
+        ip = conn.get("ip", SERVER_IP)
+        port = conn.get("port", SERVER_PORT)
+        status = "ONLINE" if conn.get("alive", True) else "OFFLINE"
+    else:
+        server_name = getattr(conn, "active_server", "PRIMARY")
+        ip = getattr(conn, "active_ip", SERVER_IP)
+        port = getattr(conn, "active_port", SERVER_PORT)
+        status = "ONLINE" if getattr(conn, "is_connected", True) else "OFFLINE"
 
     print("\n================================================")
-    print("           NETFAILOVER CLIENT")
+    print("           NETFAILOVER CLIENT STATUS            ")
     print("================================================")
     print(f"Active Server : {server_name}")
-    print(f"Server        : {ip}:{port}")
+    print(f"Server Target : {ip}:{port}")
     print(f"Status        : {status}")
     print("================================================\n")
 
-def heartbeat_worker(conn, socket_lock, stop_event):
+
+class NetFailoverClient:
     """
-    Background worker that sends periodic PING heartbeats to the active server,
-    measures round-trip response time, and triggers automatic failover to the
-    Backup Server after 3 consecutive missed heartbeats from the Primary Server.
+    Reusable client manager for the NetFailover system.
+    Handles Primary connection, Backup failover, periodic heartbeat probing,
+    timeout detection, and event notifications.
     """
-    missed_heartbeats = 0
-    first_failure_time = None
 
-    while not stop_event.is_set():
-        # Wait for the next heartbeat interval or until stopped
-        if stop_event.wait(HEARTBEAT_INTERVAL):
-            break
+    def __init__(
+        self,
+        primary_ip=SERVER_IP,
+        primary_port=SERVER_PORT,
+        backup_ip=BACKUP_SERVER_IP,
+        backup_port=BACKUP_SERVER_PORT,
+        heartbeat_interval=HEARTBEAT_INTERVAL,
+        socket_timeout=SOCKET_TIMEOUT,
+        max_missed_heartbeats=MAX_MISSED_HEARTBEATS,
+        event_callback=None
+    ):
+        self.primary_ip = primary_ip
+        self.primary_port = primary_port
+        self.backup_ip = backup_ip
+        self.backup_port = backup_port
+        self.heartbeat_interval = heartbeat_interval
+        self.socket_timeout = socket_timeout
+        self.max_missed_heartbeats = max_missed_heartbeats
+        self.event_callback = event_callback
 
-        # Acquire lock so heartbeat and user commands do not collide on the socket
-        with socket_lock:
-            if not conn["alive"] or conn["socket"] is None:
-                break
+        # Sockets and synchronization
+        self.socket = None
+        self.socket_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.heartbeat_thread = None
 
-            current_server = conn["server"]
-            current_socket = conn["socket"]
-            probe_start = time.time()
+        # State tracking
+        self.active_server = "PRIMARY"
+        self.active_ip = self.primary_ip
+        self.active_port = self.primary_port
+        self.is_connected = False
 
+        # Metrics
+        self.missed_heartbeats = 0
+        self.first_failure_time = None
+        self.last_response_time = 0.0
+        self.last_detection_time = 0.0
+        self.failover_duration = 0.0
+
+    def set_callback(self, callback):
+        """Registers a callback function to receive networking events."""
+        self.event_callback = callback
+
+    def _notify(self, event_type, **kwargs):
+        """Dispatches an event dictionary to the registered callback."""
+        if self.event_callback:
+            event_data = {
+                "active_server": self.active_server,
+                "ip": self.active_ip,
+                "port": self.active_port,
+                "missed_count": self.missed_heartbeats,
+                "response_time": self.last_response_time,
+                "detection_time": self.last_detection_time,
+                "failover_duration": self.failover_duration,
+            }
+            event_data.update(kwargs)
             try:
-                print(f"\n[HEARTBEAT] PING -> {current_server}")
-                current_socket.sendall("PING".encode("utf-8"))
+                self.event_callback(event_type, event_data)
+            except Exception as e:
+                print(f"[CALLBACK ERROR] Error in event callback: {e}")
 
-                # Wait for server response (up to SOCKET_TIMEOUT)
-                response = current_socket.recv(1024).decode("utf-8").strip()
-                elapsed_ms = (time.time() - probe_start) * 1000
+    def connect(self):
+        """
+        Connects initially to the Primary Server.
+        Returns True if successful, False otherwise.
+        """
+        self.stop_event.clear()
+        with self.socket_lock:
+            try:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket.settimeout(self.socket_timeout)
+                self.socket.connect((self.primary_ip, self.primary_port))
 
-                if response == "PONG":
-                    print(f"[HEARTBEAT] PONG <- {current_server} (Response time: {elapsed_ms:.2f} ms)")
-                    # Reset failure counter and timer upon a successful heartbeat
-                    missed_heartbeats = 0
-                    first_failure_time = None
-                else:
-                    print(f"[HEARTBEAT] Unexpected response from {current_server}: {response}")
-                    missed_heartbeats += 1
-                    if first_failure_time is None:
-                        first_failure_time = probe_start
+                self.active_server = "PRIMARY"
+                self.active_ip = self.primary_ip
+                self.active_port = self.primary_port
+                self.is_connected = True
+                self.missed_heartbeats = 0
+                self.first_failure_time = None
 
-            except socket.timeout:
-                missed_heartbeats += 1
-                if first_failure_time is None:
-                    first_failure_time = probe_start
-                print(f"[HEARTBEAT] Timeout: No response from {current_server} ({missed_heartbeats}/{MAX_MISSED_HEARTBEATS} missed).")
+                self._notify(
+                    "PRIMARY_CONNECTED",
+                    ip=self.primary_ip,
+                    port=self.primary_port
+                )
+                return True
 
             except Exception as e:
-                if not stop_event.is_set():
-                    missed_heartbeats += 1
-                    if first_failure_time is None:
-                        first_failure_time = probe_start
-                    print(f"[HEARTBEAT] Connection error from {current_server} ({missed_heartbeats}/{MAX_MISSED_HEARTBEATS} missed): {e}")
-
-            # Trigger automatic failover after 3 consecutive missed heartbeats
-            if missed_heartbeats >= MAX_MISSED_HEARTBEATS:
-                detection_time = time.time() - first_failure_time
-                print("\n[FAILURE DETECTED] Primary server is not responding.")
-                print(f"[FAILURE DETECTED] Approximate failure detection time: {detection_time:.2f} seconds.")
-
-                if current_server == "PRIMARY":
-                    print("[FAILOVER] Attempting connection to Backup Server...")
-                    # 1. Close failed Primary connection
+                self.is_connected = False
+                if self.socket:
                     try:
-                        current_socket.close()
+                        self.socket.close()
                     except Exception:
                         pass
+                    self.socket = None
 
-                    # 2. Attempt connection to Backup Server
-                    try:
-                        backup_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        backup_socket.settimeout(SOCKET_TIMEOUT)
-                        backup_socket.connect((BACKUP_SERVER_IP, BACKUP_SERVER_PORT))
+                self._notify(
+                    "CONNECTION_FAILED",
+                    message=f"Could not connect to Primary Server at {self.primary_ip}:{self.primary_port} ({e})"
+                )
+                return False
 
-                        # 3. Update connection state and active server
-                        conn["socket"] = backup_socket
-                        conn["server"] = "BACKUP"
-                        conn["ip"] = BACKUP_SERVER_IP
-                        conn["port"] = BACKUP_SERVER_PORT
+    def start_heartbeat(self):
+        """Starts the background heartbeat worker thread."""
+        if not self.is_connected or (self.heartbeat_thread and self.heartbeat_thread.is_alive()):
+            return
 
-                        # 4. Reset heartbeat metrics for the Backup Server
-                        missed_heartbeats = 0
-                        first_failure_time = None
-
-                        print(f"[FAILOVER] Connected to Backup Server at {BACKUP_SERVER_IP}:{BACKUP_SERVER_PORT}")
-                        print("[FAILOVER] Client successfully switched to Backup Server.")
-                        display_connection_status(conn)
-
-                    except Exception as e:
-                        print(f"[FAILOVER] Could not connect to Backup Server at {BACKUP_SERVER_IP}:{BACKUP_SERVER_PORT} ({e}).")
-                        conn["alive"] = False
-                        stop_event.set()
-                        break
-                else:
-                    # If Backup Server also fails, stop heartbeat loop
-                    print(f"[ERROR] Backup server is not responding.")
-                    break
-
-def start_client():
-    # 1. Create a TCP/IP socket (AF_INET = IPv4, SOCK_STREAM = TCP)
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.settimeout(SOCKET_TIMEOUT)
-
-    # Thread synchronization primitives
-    socket_lock = threading.Lock()
-    stop_event = threading.Event()
-
-    # Shared connection state
-    conn = {
-        "socket": client_socket,
-        "server": "PRIMARY",
-        "ip": SERVER_IP,
-        "port": SERVER_PORT,
-        "alive": True
-    }
-
-    try:
-        # 2. Connect initially to the Primary Server
-        client_socket.connect((SERVER_IP, SERVER_PORT))
-        print(f"[CONNECTED] Successfully connected to server at {SERVER_IP}:{SERVER_PORT}")
-        display_connection_status(conn)
-        print("Available commands: STATUS | TIME | MESSAGE <text> | EXIT")
-
-        # 3. Start background heartbeat thread
-        heartbeat_thread = threading.Thread(
-            target=heartbeat_worker,
-            args=(conn, socket_lock, stop_event),
+        self.heartbeat_thread = threading.Thread(
+            target=self._heartbeat_worker,
             daemon=True
         )
-        heartbeat_thread.start()
+        self.heartbeat_thread.start()
 
-        # 4. Interactive loop to accept and send user commands
-        while not stop_event.is_set():
+    def _heartbeat_worker(self):
+        """
+        Background worker that sends periodic PING heartbeats, measures response times,
+        and triggers automatic failover if Primary Server fails.
+        """
+        while not self.stop_event.is_set():
+            if self.stop_event.wait(self.heartbeat_interval):
+                break
+
+            with self.socket_lock:
+                if not self.is_connected or self.socket is None:
+                    break
+
+                probe_start = time.time()
+                current_target = self.active_server
+
+                try:
+                    self._notify("HEARTBEAT_PING", active_server=current_target)
+                    self.socket.sendall("PING".encode("utf-8"))
+
+                    response = self.socket.recv(BUFFER_SIZE).decode("utf-8").strip()
+                    elapsed_ms = (time.time() - probe_start) * 1000
+                    self.last_response_time = elapsed_ms
+
+                    if response == "PONG":
+                        self.missed_heartbeats = 0
+                        self.first_failure_time = None
+                        self._notify(
+                            "HEARTBEAT_PONG",
+                            active_server=current_target,
+                            response_time=elapsed_ms
+                        )
+                    else:
+                        self.missed_heartbeats += 1
+                        if self.first_failure_time is None:
+                            self.first_failure_time = probe_start
+                        self._notify(
+                            "HEARTBEAT_MISSED",
+                            active_server=current_target,
+                            missed_count=self.missed_heartbeats,
+                            error=f"Unexpected reply: {response}"
+                        )
+
+                except socket.timeout:
+                    self.missed_heartbeats += 1
+                    if self.first_failure_time is None:
+                        self.first_failure_time = probe_start
+                    self._notify(
+                        "HEARTBEAT_MISSED",
+                        active_server=current_target,
+                        missed_count=self.missed_heartbeats,
+                        error="Socket timeout (no response within 3s)"
+                    )
+
+                except Exception as e:
+                    if not self.stop_event.is_set():
+                        self.missed_heartbeats += 1
+                        if self.first_failure_time is None:
+                            self.first_failure_time = probe_start
+                        self._notify(
+                            "HEARTBEAT_MISSED",
+                            active_server=current_target,
+                            missed_count=self.missed_heartbeats,
+                            error=str(e)
+                        )
+
+                # Check if failure threshold reached
+                if self.missed_heartbeats >= self.max_missed_heartbeats:
+                    detection_time = time.time() - self.first_failure_time
+                    self.last_detection_time = detection_time
+
+                    self._notify(
+                        "FAILURE_DETECTED",
+                        failed_server=current_target,
+                        detection_time=detection_time
+                    )
+
+                    if self.active_server == "PRIMARY":
+                        failover_start = time.time()
+                        self._notify("FAILOVER_STARTED")
+
+                        # 1. Close failed Primary connection
+                        try:
+                            self.socket.close()
+                        except Exception:
+                            pass
+
+                        # 2. Attempt connection to Backup Server
+                        try:
+                            backup_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            backup_socket.settimeout(self.socket_timeout)
+                            backup_socket.connect((self.backup_ip, self.backup_port))
+
+                            self.failover_duration = (time.time() - failover_start) * 1000
+
+                            # 3. Update connection state and active server
+                            self.socket = backup_socket
+                            self.active_server = "BACKUP"
+                            self.active_ip = self.backup_ip
+                            self.active_port = self.backup_port
+
+                            # 4. Reset failure metrics
+                            self.missed_heartbeats = 0
+                            self.first_failure_time = None
+
+                            self._notify(
+                                "BACKUP_CONNECTED",
+                                ip=self.backup_ip,
+                                port=self.backup_port
+                            )
+                            self._notify(
+                                "FAILOVER_COMPLETED",
+                                active_server="BACKUP",
+                                ip=self.backup_ip,
+                                port=self.backup_port,
+                                detection_time=detection_time,
+                                failover_duration=self.failover_duration
+                            )
+
+                        except Exception as e:
+                            self.is_connected = False
+                            self.stop_event.set()
+                            self._notify(
+                                "CONNECTION_FAILED",
+                                message=f"Could not connect to Backup Server at {self.backup_ip}:{self.backup_port} ({e})"
+                            )
+                            break
+                    else:
+                        # Backup Server also failed
+                        self.is_connected = False
+                        self.stop_event.set()
+                        self._notify(
+                            "DISCONNECTED",
+                            message="Backup Server unreachable."
+                        )
+                        break
+
+    def send_command(self, command):
+        """
+        Sends an interactive command to the currently active server.
+        Returns the server's reply string, or None if transmission fails.
+        """
+        with self.socket_lock:
+            if not self.is_connected or self.socket is None:
+                return None
+
+            try:
+                self.socket.sendall(command.encode("utf-8"))
+
+                if command.upper() == "EXIT":
+                    return "Exiting session."
+
+                response = self.socket.recv(BUFFER_SIZE).decode("utf-8").strip()
+                if not response:
+                    return None
+                return response
+
+            except Exception:
+                return None
+
+    def disconnect(self):
+        """Cleanly stops heartbeat monitoring and closes the active socket."""
+        self.stop_event.set()
+        with self.socket_lock:
+            self.is_connected = False
+            if self.socket:
+                try:
+                    self.socket.close()
+                except Exception:
+                    pass
+                self.socket = None
+
+        if self.heartbeat_thread and threading.current_thread() != self.heartbeat_thread:
+            self.heartbeat_thread.join(timeout=1.0)
+            self.heartbeat_thread = None
+
+        self._notify("DISCONNECTED")
+
+
+def start_client():
+    """
+    Command-line interface (CLI) for running the client interactively.
+    Invoked when running: python client.py
+    """
+    def cli_event_handler(event_type, data):
+        if event_type == "PRIMARY_CONNECTED":
+            print(f"[CONNECTED] Successfully connected to server at {data['ip']}:{data['port']}")
+            display_connection_status(data)
+            print("Available commands: STATUS | TIME | MESSAGE <text> | EXIT\n")
+        elif event_type == "HEARTBEAT_PING":
+            print(f"\n[HEARTBEAT] PING -> {data['active_server']}")
+        elif event_type == "HEARTBEAT_PONG":
+            print(f"[HEARTBEAT] PONG <- {data['active_server']} (Response time: {data['response_time']:.2f} ms)")
+        elif event_type == "HEARTBEAT_MISSED":
+            print(f"[HEARTBEAT] Timeout: No response from {data['active_server']} ({data['missed_count']}/{MAX_MISSED_HEARTBEATS} missed).")
+        elif event_type == "FAILURE_DETECTED":
+            print(f"\n[FAILURE DETECTED] Primary server is not responding.")
+            print(f"[FAILURE DETECTED] Approximate failure detection time: {data['detection_time']:.2f} seconds.")
+        elif event_type == "FAILOVER_STARTED":
+            print("[FAILOVER] Attempting connection to Backup Server...")
+        elif event_type == "FAILOVER_COMPLETED":
+            print(f"[FAILOVER] Connected to Backup Server at {data['ip']}:{data['port']}")
+            print(f"[FAILOVER] Reconnection handshake took: {data.get('failover_duration', 0.0):.2f} ms")
+            print("[FAILOVER] Client successfully switched to Backup Server.")
+            display_connection_status(data)
+        elif event_type == "CONNECTION_FAILED":
+            print(f"[ERROR] {data.get('message', 'Connection failed.')}")
+
+    client = NetFailoverClient(event_callback=cli_event_handler)
+
+    try:
+        success = client.connect()
+        if not success:
+            return
+
+        client.start_heartbeat()
+
+        while client.is_connected:
             try:
                 command = input("Enter command: ").strip()
             except (KeyboardInterrupt, EOFError):
                 break
 
-            # Ignore empty input and prompt again
             if not command:
                 continue
 
-            with socket_lock:
-                if not conn["alive"] or conn["socket"] is None:
-                    print("[ERROR] No active server connection available.")
+            if command.upper() == "EXIT":
+                print("[EXIT] Exiting client session...")
+                client.send_command("EXIT")
+                break
+
+            response = client.send_command(command)
+            if response is None:
+                if not client.is_connected:
+                    print("[DISCONNECTED] Server closed the connection.")
                     break
+                print(f"[ERROR] Communication error with {client.active_server} server.")
+            else:
+                print(f"[RECEIVED] Server response: {response}")
 
-                active_socket = conn["socket"]
-                active_server = conn["server"]
-
-                try:
-                    # Send the entered command to the active server
-                    active_socket.sendall(command.encode("utf-8"))
-
-                    # If user enters EXIT, break the loop to close session
-                    if command.upper() == "EXIT":
-                        print("[EXIT] Exiting client session...")
-                        break
-
-                    # Receive response from active server (buffer size 1024 bytes)
-                    response = active_socket.recv(1024).decode("utf-8").strip()
-                    if not response:
-                        print(f"[DISCONNECTED] {active_server} server closed the connection.")
-                        break
-
-                    print(f"[RECEIVED] Server response: {response}")
-
-                except socket.timeout:
-                    print(f"[ERROR] Connection timed out waiting for response from {active_server} server.")
-                except Exception as e:
-                    print(f"[ERROR] Communication error with {active_server} server: {e}")
-
-    except socket.timeout:
-        print("[ERROR] Connection timed out while connecting to Primary Server.")
     except Exception as e:
         print(f"[ERROR] An error occurred: {e}")
 
     finally:
-        # 5. Clean up background thread and close whichever socket is active
-        stop_event.set()
-        with socket_lock:
-            conn["alive"] = False
-            if conn["socket"]:
-                try:
-                    conn["socket"].close()
-                except Exception:
-                    pass
+        client.disconnect()
         print("[CLOSED] Socket connection closed.")
+
 
 if __name__ == "__main__":
     start_client()
