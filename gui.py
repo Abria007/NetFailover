@@ -81,14 +81,33 @@ def clear_log():
         add_log("Event log cleared.", "INFO")
 
 
-def draw_topology(primary_status="OFFLINE", backup_status="STANDBY", active="PRIMARY"):
+topology_state = {
+    "primary": "OFFLINE",
+    "backup": "STANDBY",
+    "active": "PRIMARY"
+}
+
+
+def draw_topology(primary_status=None, backup_status=None, active=None):
     """
     Draws the live network topology diagram on the Canvas:
     Client node on the left, Primary and Backup server nodes on the right,
     with dynamic color-coded links showing active routing and failures.
     """
+    global topology_state
     if canvas_topo is None:
         return
+
+    if primary_status is not None:
+        topology_state["primary"] = primary_status
+    if backup_status is not None:
+        topology_state["backup"] = backup_status
+    if active is not None:
+        topology_state["active"] = active
+
+    p_status = topology_state["primary"]
+    b_status = topology_state["backup"]
+    act = topology_state["active"]
 
     canvas_topo.delete("all")
     w = canvas_topo.winfo_width() or 860
@@ -108,20 +127,20 @@ def draw_topology(primary_status="OFFLINE", backup_status="STANDBY", active="PRI
     link_back_width = 2
     link_back_dash = (4, 4)
 
-    if primary_status == "ONLINE" and active == "PRIMARY":
+    if p_status == "ONLINE" and act == "PRIMARY":
         link_prim_color = "#10b981"  # Emerald active
         link_prim_width = 3
         link_prim_dash = ()
-    elif primary_status in ("OFFLINE", "TIMEOUT"):
+    elif p_status in ("OFFLINE", "TIMEOUT"):
         link_prim_color = "#ef4444"  # Red failed
         link_prim_width = 3
         link_prim_dash = (3, 3)
 
-    if backup_status == "ONLINE" and active == "BACKUP":
+    if b_status == "ONLINE" and act == "BACKUP":
         link_back_color = "#10b981"  # Emerald active
         link_back_width = 3
         link_back_dash = ()
-    elif backup_status == "STANDBY":
+    elif b_status == "STANDBY":
         link_back_color = "#38bdf8"  # Cyan standby
         link_back_width = 2
         link_back_dash = (6, 4)
@@ -140,18 +159,18 @@ def draw_topology(primary_status="OFFLINE", backup_status="STANDBY", active="PRI
     draw_node(client_x, client_y, "CLIENT", "NetFailover App", "#1e293b", "#38bdf8")
 
     # Draw Primary Server Node
-    prim_bg = "#064e3b" if primary_status == "ONLINE" else "#450a0a"
-    prim_border = "#10b981" if primary_status == "ONLINE" else "#ef4444"
-    draw_node(prim_x, prim_y, f"PRIMARY :{SERVER_PORT}", f"[{primary_status}]", prim_bg, prim_border)
+    prim_bg = "#064e3b" if p_status == "ONLINE" else "#450a0a"
+    prim_border = "#10b981" if p_status == "ONLINE" else "#ef4444"
+    draw_node(prim_x, prim_y, f"PRIMARY :{SERVER_PORT}", f"[{p_status}]", prim_bg, prim_border)
 
     # Draw Backup Server Node
-    if backup_status == "ONLINE" and active == "BACKUP":
+    if b_status == "ONLINE" and act == "BACKUP":
         back_bg = "#064e3b"
         back_border = "#10b981"
     else:
         back_bg = "#0c4a6e"
         back_border = "#38bdf8"
-    draw_node(back_x, back_y, f"BACKUP :{BACKUP_SERVER_PORT}", f"[{backup_status}]", back_bg, back_border)
+    draw_node(back_x, back_y, f"BACKUP :{BACKUP_SERVER_PORT}", f"[{b_status}]", back_bg, back_border)
 
 
 def update_missed_blocks(missed_count):
@@ -326,6 +345,20 @@ def send_gui_command(command_text):
             root.after(0, lambda: add_log(f"RX <- No response from {client.active_server}!", "FAIL"))
 
     threading.Thread(target=command_worker, daemon=True).start()
+
+
+def trigger_simulated_crash():
+    """Simulates primary server failure by instructing primary server to crash."""
+    global client
+    if not client or not client.is_connected:
+        add_log("Cannot simulate crash: Client is not connected to any server.", "FAIL")
+        return
+    if client.active_server != "PRIMARY":
+        add_log("Primary Server is already OFFLINE.", "WARN")
+        return
+
+    add_log("Triggering simulated crash of Primary Server...", "WARN")
+    send_gui_command("CRASH")
 
 
 def on_send_message():
@@ -554,7 +587,23 @@ def create_dashboard():
         state="disabled",
         command=stop_monitoring
     )
-    btn_stop.pack(side=tk.LEFT, padx=(0, 14))
+    btn_stop.pack(side=tk.LEFT, padx=(0, 6))
+
+    btn_crash = tk.Button(
+        actions_card,
+        text="💥 KILL PRIMARY (TEST FAILOVER)",
+        font=("Segoe UI", 9, "bold"),
+        bg="#b91c1c",
+        fg="#ffffff",
+        activebackground="#991b1b",
+        activeforeground="#ffffff",
+        relief="flat",
+        padx=10,
+        pady=4,
+        cursor="hand2",
+        command=trigger_simulated_crash
+    )
+    btn_crash.pack(side=tk.LEFT, padx=(0, 14))
 
     # Separator
     tk.Label(actions_card, text="|", fg="#475569", bg=card_bg).pack(side=tk.LEFT, padx=(0, 10))

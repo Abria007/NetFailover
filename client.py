@@ -204,7 +204,10 @@ class NetFailoverClient:
                     self._notify("HEARTBEAT_PING", active_server=current_target)
                     self.socket.sendall("PING".encode("utf-8"))
 
-                    response = self.socket.recv(BUFFER_SIZE).decode("utf-8").strip()
+                    raw_data = self.socket.recv(BUFFER_SIZE)
+                    if not raw_data:
+                        raise ConnectionResetError("Remote server closed connection")
+                    response = raw_data.decode("utf-8").strip()
                     elapsed_ms = (time.time() - probe_start) * 1000
                     self.last_response_time = elapsed_ms
 

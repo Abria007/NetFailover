@@ -59,6 +59,18 @@ def start_primary_server():
                     elif data.startswith("MESSAGE "):
                         message_text = data[8:]
                         response = f"Received message: {message_text}"
+                    elif data in ("CRASH", "KILL"):
+                        print(f"\n[SIMULATED CRASH] Crash requested by client {client_address}! Shutting down Primary Server...")
+                        try:
+                            client_socket.close()
+                        except Exception:
+                            pass
+                        try:
+                            server_socket.close()
+                        except Exception:
+                            pass
+                        import os
+                        os._exit(0)
                     elif data == "EXIT":
                         print(f"[EXIT] Client {client_address} sent EXIT.")
                         break
